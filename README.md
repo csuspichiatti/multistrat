@@ -66,4 +66,4 @@ Output of every backtest includes Sharpe (annualized), max drawdown, total/annua
 
 ## Author
 
-Carlos Suspichiatti — CFA Level 3 candidate. 16+ years in finance and investments.
+Carlos Suspichiatti. CFA Levels I and II passed. 16+ years in finance and investments.
