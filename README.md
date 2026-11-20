@@ -7,11 +7,29 @@ A modular Python framework for systematic strategies across equities, FX and mac
 **1. US equities pairs trading + VIX overlay** (`strategies/pairs_us.py`)
 Engle-Granger cointegration on rolling windows, OLS hedge ratio estimation, z-score entries on the residual spread, dollar-neutral sizing. VIX threshold acts as a kill switch during stress regimes when correlation structure typically breaks down. Universe: 8 large-cap pairs (KO/PEP, V/MA, MSFT/AAPL, JPM/BAC, XOM/CVX, HD/LOW, WMT/TGT, GS/MS).
 
-**2. Cross-asset macro: USD/CLP vs copper (HG)** (in progress)
+**2. Cross-asset macro: USD/CLP vs copper (HG)** (planned, not implemented yet)
 The Chilean peso is structurally exposed to copper (Chile produces ~28% of world copper). Rolling regression of USDCLP on HG futures, residual z-score signals dislocations, mean-reversion trade in the spread.
 
-**3. Selective FX carry with VIX filter** (in progress)
+**3. Selective FX carry with VIX filter** (planned, not implemented yet)
 High-yielding crosses (AUDJPY, NZDJPY, MXNJPY) entered when implied vol is low (risk-on), exited when VIX spikes above threshold. Carry capture with embedded risk-off circuit breaker.
+
+### Risk management in Strategy 1
+
+Entries require **stable** cointegration (p-value ≤ 0.05 for 20 consecutive bars) and a spread half-life between 2 and 100 bars, which filters most spurious pairs between independent random walks.
+
+At entry the bot **freezes** alpha, beta, spread mean and spread std. Every exit is measured against that snapshot, so the z-score stop cannot be diluted by a rolling std that widens together with the loss, and the z reflects the position actually held. Exits, in priority order:
+
+| Exit | Rule (defaults) |
+|---|---|
+| Hard USD stop | pair loss ≥ 1% of equity at entry |
+| z stop | frozen \|z\| > 4 |
+| Time stop | 3 × spread half-life (floor 20, cap 500 bars) |
+| Cointegration break | p-value > 0.20 for 10 consecutive bars (hysteresis) |
+| Take profit | frozen z back inside ±0.5, or crossed the mean |
+| VIX kill switch | VIX > 28 closes everything and blocks entries |
+| Daily kill switch | intraday drawdown > 3% closes everything until next day |
+
+Orders decided on the close of bar *t* are filled on the **open of bar t+1** (or its close when opens are not available), never on the signal bar.
 
 ## Architecture
 
@@ -22,9 +40,7 @@ multistrat/
 │   ├── paper_trader.py  Simulated execution with realistic fees & slippage
 │   └── risk.py          Vol-targeted sizing, dollar-neutral, exposure caps
 ├── strategies/
-│   ├── pairs_us.py      Strategy 1
-│   ├── clp_copper.py    Strategy 2
-│   └── fx_carry.py      Strategy 3
+│   └── pairs_us.py      Strategy 1 (strategies 2 and 3: planned)
 ├── backtest/
 │   ├── runner_pairs.py  Event-driven bar-by-bar backtest
 │   └── run_real_pairs.py  Backtest with real yfinance data
@@ -55,14 +71,18 @@ Costs are explicit: `fee_bps` and `slippage_bps` are configured per backtest and
 
 ## Performance metrics
 
-Output of every backtest includes Sharpe (annualized), max drawdown, total/annualized return, hit rate on closed trades, total fees paid, and end-of-backtest state of every pair (cointegration p-value, β, final z-score).
+Output of every backtest includes Sharpe (annualized with bars-per-day inferred from the data, e.g. 7 × 252 for US 1h bars), max drawdown, total/annualized return, hit rate per completed pair round trip, PnL by exit reason and by pair, total fees paid, kill-switch days, and end-of-backtest state of every pair (cointegration p-value, β, half-life, final z-score).
 
 ## Status
 
 - Core: complete
-- Strategy 1: complete (backtest engine), pending validation on real data
-- Strategies 2 and 3: skeleton, lógica pendiente
-- Live execution via MetaTrader5 (Capitaria CFDs): planned phase 2
+- Strategy 1: backtest engine complete with risk layer; **pending validation on real data** (`python -m backtest.run_real_pairs`). On synthetic data it is roughly breakeven after costs: it trades the cointegrated pair correctly but the edge is thin. Do not trade it live on the strength of the synthetic demo.
+- Strategies 2 and 3: not implemented
+- Live execution via MetaTrader5 (Capitaria CFDs): planned phase 2. Before going live it needs leg-risk handling (unwind the filled leg if the other one fails), position reconciliation after reconnects, and an earnings blackout.
+
+### Changelog
+
+- 2026-11: fixed inverted leg signs in `compute_qty` (the strategy was buying the expensive leg and lost money even on a synthetic cointegrated pair); added frozen-snapshot exits, hard USD stop, time stop, p-value hysteresis, stable-cointegration and half-life entry filters, next-bar execution, daily kill switch, correct annualization and per-pair hit rate.
 
 ## Author
 
