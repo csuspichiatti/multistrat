@@ -81,6 +81,27 @@ def run_pairs_backtest(panel: pd.DataFrame,
     pending: dict[tuple[str, str], tuple[int, str]] = {}   # par -> (target, motivo)
 
     has_vix = vix_col in panel.columns
+
+    # Calendario de trading = barras donde cotiza al menos una acción de los
+    # pares. El VIX de Yahoo tiene horario extendido (~20 barras/día vs 7 de
+    # las acciones); sin este filtro el panel trae barras solo-VIX donde las
+    # posiciones quedan sin precio, el equity salta, la volatilidad y el
+    # drawdown se inflan, se disparan kill switches falsos, el stop por tiempo
+    # cuenta horas fuera de mercado y periods_per_year sale ~3x.
+    pair_cols = sorted({t for p in pairs_valid for t in p})
+    if has_vix:
+        vix_ff = panel[vix_col].ffill()
+    keep = panel[pair_cols].notna().any(axis=1)
+    panel = panel.loc[keep].copy()
+    if has_vix:
+        panel[vix_col] = vix_ff.loc[keep]
+    if open_panel is not None:
+        open_panel = open_panel.reindex(index=panel.index)
+    # Precios para valorizar: último precio conocido (nunca futuro)
+    mark_panel = panel.ffill()
+    if warmup_bars >= len(panel):
+        return trader, {"error": "Muy pocas barras tras alinear calendario."}
+
     blocked_day = None          # fecha bloqueada por kill switch diario
     kill_days: list = []
     day_key, day_high = None, None
@@ -147,8 +168,9 @@ def run_pairs_backtest(panel: pd.DataFrame,
 
     for i in range(warmup_bars, len(panel)):
         ts = panel.index[i]
-        prices = row_prices(panel, i)
-        exec_prices = row_prices(open_panel, i) if open_panel is not None else prices
+        prices = row_prices(mark_panel, i)          # valorización (ffill)
+        live = row_prices(panel, i)                 # solo precios de esta barra
+        exec_prices = row_prices(open_panel, i) if open_panel is not None else live
 
         # 1. Ejecutar lo decidido en la barra anterior
         for key, (target, reason) in list(pending.items()):
@@ -219,7 +241,7 @@ def run_pairs_backtest(panel: pd.DataFrame,
 
     # Cerrar posiciones al final del backtest
     last_ts = panel.index[-1]
-    last_prices = row_prices(panel, len(panel) - 1)
+    last_prices = row_prices(mark_panel, len(panel) - 1)
     for key, st in states.items():
         if st.position != 0:
             execute(key, 0, "fin_backtest", last_ts, last_prices, last_prices)
