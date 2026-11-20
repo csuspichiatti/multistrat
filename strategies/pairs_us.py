@@ -74,6 +74,12 @@ class PairsConfig:
     p_entry_bars: int   = 20        # barras seguidas con p <= p_value_max para habilitar entradas
     half_life_min: float = 2.0      # vida media del spread aceptable (barras)
     half_life_max: float = 100.0    # más lento que esto no es operable con estas ventanas
+
+    # Rendimiento: cointegración, beta y vida media se re-estiman cada
+    # `recalc_every` barras (7 ≈ una vez por día de mercado en 1h). El z-score
+    # y los stops se evalúan en TODAS las barras con la última estimación.
+    recalc_every: int = 7
+    coint_maxlag: Optional[int] = 1   # lags del ADF; None = autolag AIC (≈50x más lento)
     z_entry:      float = 2.0
     z_exit:       float = 0.5
     z_stop:       float = 4.0       # medido con estadísticas congeladas a la entrada
@@ -131,20 +137,27 @@ class PairState:
 
 def estimate_beta(y: pd.Series, x: pd.Series) -> tuple[float, float]:
     """OLS y = alpha + beta*x. Retorna (alpha, beta)."""
-    X = sm.add_constant(x.values)
-    model = sm.OLS(y.values, X, missing="drop").fit()
+    X = sm.add_constant(np.asarray(x, dtype=float))
+    model = sm.OLS(np.asarray(y, dtype=float), X, missing="drop").fit()
     return float(model.params[0]), float(model.params[1])
 
 
-def cointegration_pvalue(y: pd.Series, x: pd.Series) -> float:
+def cointegration_pvalue(y, x, maxlag: Optional[int] = None) -> float:
     """
     Engle-Granger p-value de y sobre x (misma dirección que el OLS de beta).
-    Más bajo = más cointegrados.
+    Más bajo = más cointegrados. maxlag=None usa autolag AIC (lento);
+    un entero fija los lags del ADF (rápido).
     """
-    if len(y) < 30 or len(x) < 30:
+    y = np.asarray(y, dtype=float); x = np.asarray(x, dtype=float)
+    ok = np.isfinite(y) & np.isfinite(x)
+    y, x = y[ok], x[ok]
+    if len(y) < 30:
         return 1.0
     try:
-        _t, p, _ = coint(y.dropna(), x.dropna())
+        if maxlag is None:
+            _t, p, _ = coint(y, x)
+        else:
+            _t, p, _ = coint(y, x, maxlag=maxlag, autolag=None)
         return float(p)
     except Exception:
         return 1.0
@@ -155,44 +168,53 @@ def spread_half_life(spread: pd.Series) -> float:
     Vida media de reversión del spread (en barras) vía AR(1):
     Δs_t = λ·s_{t-1} + ε  →  half_life = -ln(2)/λ. NaN si no revierte.
     """
-    s = spread.dropna()
+    s = np.asarray(spread, dtype=float)
+    s = s[np.isfinite(s)]
     if len(s) < 30:
         return float("nan")
-    lag = s.shift(1).iloc[1:]
-    delta = s.diff().iloc[1:]
-    lam = np.polyfit(lag.values - lag.values.mean(), delta.values, 1)[0]
+    lag = s[:-1]
+    delta = np.diff(s)
+    lam = np.polyfit(lag - lag.mean(), delta, 1)[0]
     if lam >= 0:
         return float("nan")
     return float(-np.log(2) / lam)
 
 
 def update_pair_signal(state: PairState,
-                       a: pd.Series, b: pd.Series,
-                       cfg: PairsConfig) -> PairState:
+                       a, b,
+                       cfg: PairsConfig,
+                       recompute: bool = True) -> PairState:
     """
-    Recibe series de A y B truncadas hasta el momento actual (sin datos futuros).
-    Actualiza la estimación vigente (para entrar) y, si hay posición, el z
-    de la posición con la foto congelada (para salir).
+    Recibe A y B (Series o arrays) truncadas hasta el momento actual, sin
+    datos futuros. Basta con pasar las últimas max(coint_window, beta_window)
+    barras.
+
+    recompute=True: re-estima p-value, alpha, beta y vida media (caro).
+    recompute=False: reutiliza la última estimación y solo actualiza z,
+    z_pos y contadores (barato). El runner alterna según cfg.recalc_every.
     """
+    a = np.asarray(a, dtype=float); b = np.asarray(b, dtype=float)
     if len(a) < cfg.coint_window or len(b) < cfg.coint_window:
         return state
 
-    a_w = a.iloc[-cfg.coint_window:]
-    b_w = b.iloc[-cfg.coint_window:]
-    state.p_value = cointegration_pvalue(b_w, a_w)
-    state.alpha, state.beta = estimate_beta(b_w, a_w)
+    if recompute:
+        a_w = a[-cfg.coint_window:]
+        b_w = b[-cfg.coint_window:]
+        state.p_value = cointegration_pvalue(b_w, a_w, maxlag=cfg.coint_maxlag)
+        state.alpha, state.beta = estimate_beta(b_w, a_w)
+        hl_n = cfg.beta_window
+        state.half_life = spread_half_life(b[-hl_n:] - state.alpha - state.beta * a[-hl_n:])
 
-    spread_full = b - state.alpha - state.beta * a
-    spread_recent = spread_full.iloc[-cfg.zscore_window:]
-    state.spread_mean = float(spread_recent.mean())
-    state.spread_std  = float(spread_recent.std())
-    state.z = (float((spread_full.iloc[-1] - state.spread_mean) / state.spread_std)
+    zw = cfg.zscore_window
+    spread_recent = b[-zw:] - state.alpha - state.beta * a[-zw:]
+    state.spread_mean = float(np.nanmean(spread_recent))
+    state.spread_std  = float(np.nanstd(spread_recent, ddof=1))
+    state.z = (float((spread_recent[-1] - state.spread_mean) / state.spread_std)
                if state.spread_std > 0 else 0.0)
-    state.half_life = spread_half_life(spread_full.iloc[-cfg.beta_window:])
     state.p_good_bars = state.p_good_bars + 1 if state.p_value <= cfg.p_value_max else 0
 
     if state.position != 0:
-        s_pos = float(b.iloc[-1] - state.entry_alpha - state.entry_beta * a.iloc[-1])
+        s_pos = float(b[-1] - state.entry_alpha - state.entry_beta * a[-1])
         state.z_pos = ((s_pos - state.entry_mean) / state.entry_std
                        if state.entry_std > 0 else 0.0)
         state.p_bad_bars = state.p_bad_bars + 1 if state.p_value > cfg.p_value_exit else 0

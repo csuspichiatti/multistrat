@@ -29,6 +29,8 @@ At entry the bot **freezes** alpha, beta, spread mean and spread std. Every exit
 | VIX kill switch | VIX > 28 closes everything and blocks entries |
 | Daily kill switch | intraday drawdown > 3% closes everything until next day |
 
+Cointegration, beta and half-life are re-estimated every `recalc_every` bars (default 7, about once per US trading day on 1h data) with a fixed-lag ADF (`coint_maxlag=1`); z-scores and all stops are evaluated on every bar. A full 3-year 1h run over 8 pairs takes about a minute and prints progress every 5%.
+
 Orders decided on the close of bar *t* are filled on the **open of bar t+1** (or its close when opens are not available), never on the signal bar.
 
 ## Architecture

@@ -17,11 +17,12 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import time
+
 import pandas as pd
 import numpy as np
 
 from core.paper_trader import PaperTrader
-from core.risk import daily_loss_cap_breached
 from strategies.pairs_us import (PairsConfig, PairState, update_pair_signal,
                                   decide_target_position, compute_qty,
                                   freeze_entry)
@@ -47,7 +48,8 @@ def run_pairs_backtest(panel: pd.DataFrame,
                         vix_col: str = "^VIX",
                         open_panel: pd.DataFrame = None,
                         periods_per_year: float = None,
-                        verbose: bool = False) -> tuple[PaperTrader, dict]:
+                        verbose: bool = False,
+                        progress: bool = True) -> tuple[PaperTrader, dict]:
     """
     Backtest event-driven bar-por-bar, sin look-ahead.
 
@@ -81,6 +83,22 @@ def run_pairs_backtest(panel: pd.DataFrame,
     has_vix = vix_col in panel.columns
     blocked_day = None          # fecha bloqueada por kill switch diario
     kill_days: list = []
+    day_key, day_high = None, None
+
+    # Pre-cálculo para no copiar la historia completa en cada barra (era O(n²)):
+    # por cada par, filas donde ambos precios existen y un puntero por barra.
+    hist_n = max(cfg.coint_window, cfg.beta_window, cfg.zscore_window)
+    pair_data = {}
+    for key in states:
+        a, b = key
+        both = panel[[a, b]].dropna()
+        pos_in_pair = np.searchsorted(both.index.values, panel.index.values, side="right")
+        pair_data[key] = (both[a].to_numpy(float), both[b].to_numpy(float), pos_in_pair)
+    last_recalc = {key: -10**9 for key in states}
+
+    n_bars = len(panel) - warmup_bars
+    t0 = time.time()
+    next_report = 0.0
 
     def row_prices(df, i):
         return {c: float(df[c].iloc[i]) for c in df.columns if pd.notna(df[c].iloc[i])}
@@ -137,13 +155,16 @@ def run_pairs_backtest(panel: pd.DataFrame,
             if execute(key, target, reason, ts, exec_prices, prices):
                 pending.pop(key)
 
-        # 2. Mark-to-market y kill switch diario
+        # 2. Mark-to-market y kill switch diario (máximo intradía en O(1))
         equity = trader.mark_to_market(ts, prices)
         today = ts.date()
+        if today != day_key:
+            day_key, day_high = today, equity
+        day_high = max(day_high, equity)
         if blocked_day is not None and blocked_day != today:
             blocked_day = None
-        if blocked_day is None and daily_loss_cap_breached(
-                trader.equity_series(), cfg.daily_loss_cap_pct):
+        if blocked_day is None and day_high > 0 and \
+                (equity - day_high) / day_high < -cfg.daily_loss_cap_pct:
             blocked_day = today
             kill_days.append(str(today))
             for key, st in states.items():
@@ -159,13 +180,17 @@ def run_pairs_backtest(panel: pd.DataFrame,
             if key in pending:
                 continue
             a, b = key
-            a_ser = panel[a].iloc[:i+1].dropna()
-            b_ser = panel[b].iloc[:i+1].dropna()
-            if len(a_ser) < cfg.coint_window or len(b_ser) < cfg.coint_window:
+            a_arr, b_arr, ptr = pair_data[key]
+            k = int(ptr[i])                      # filas válidas hasta la barra i inclusive
+            if k < cfg.coint_window:
                 continue
             if state.position != 0:
                 state.bars_held += 1
-            update_pair_signal(state, a_ser, b_ser, cfg)
+            recompute = (k - last_recalc[key]) >= cfg.recalc_every
+            if recompute:
+                last_recalc[key] = k
+            lo = max(0, k - hist_n)
+            update_pair_signal(state, a_arr[lo:k], b_arr[lo:k], cfg, recompute=recompute)
 
             pnl = 0.0
             if state.position != 0 and a in prices and b in prices:
@@ -179,6 +204,18 @@ def run_pairs_backtest(panel: pd.DataFrame,
                     continue
                 n_open += 1
             pending[key] = (target, state.exit_reason)
+
+        if progress and n_bars > 0:
+            frac = (i - warmup_bars + 1) / n_bars
+            if frac >= next_report or i == len(panel) - 1:
+                el = time.time() - t0
+                eta = el / frac * (1 - frac) if frac > 0 else 0
+                n_pos = sum(1 for s_ in states.values() if s_.position != 0)
+                print(f"  [{frac*100:5.1f}%] barra {i+1}/{len(panel)} {ts:%Y-%m-%d} "
+                      f"equity=${equity:,.0f} abiertos={n_pos} "
+                      f"trades={len(round_trips)} | {el:,.0f}s, faltan ~{eta:,.0f}s",
+                      flush=True)
+                next_report += 0.05
 
     # Cerrar posiciones al final del backtest
     last_ts = panel.index[-1]
