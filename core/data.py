@@ -143,16 +143,18 @@ def fetch_close(ticker: str, interval: str = "1d",
 def fetch_panel(tickers: list[str],
                 interval: str = "1h",
                 start: Optional[str] = None,
-                end: Optional[str] = None) -> pd.DataFrame:
+                end: Optional[str] = None,
+                field: str = "close") -> pd.DataFrame:
     """
-    Devuelve DataFrame con columnas = tickers, valores = close,
+    Devuelve DataFrame con columnas = tickers, valores = `field`
+    ('close' por defecto, 'open' para ejecutar en la barra siguiente),
     índice = timestamps comunes.
     """
     series = {}
     for t in tickers:
-        s = fetch_close(t, interval=interval, start=start, end=end)
-        if not s.empty:
-            series[t] = s
+        df = fetch_ohlcv(t, interval=interval, start=start, end=end)
+        if not df.empty and field in df.columns:
+            series[t] = df[field].rename(t)
     if not series:
         return pd.DataFrame()
     panel = pd.concat(series, axis=1)

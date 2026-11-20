@@ -191,6 +191,6 @@ class PaperTrader:
             "max_drawdown_pct":  float(max_dd * 100),
             "n_trades":          len(self.trades),
             "n_realized":        int(n_realized),
-            "hit_rate_pct":      float(hit_rate * 100),
+            "hit_rate_legs_pct": float(hit_rate * 100),  # por pata; ver hit_rate_pairs_pct en el runner
             "total_fees_usd":    float(sum(t.fee_usd for t in self.trades)),
         }

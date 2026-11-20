@@ -17,12 +17,27 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import time
+
 import pandas as pd
 import numpy as np
 
 from core.paper_trader import PaperTrader
 from strategies.pairs_us import (PairsConfig, PairState, update_pair_signal,
-                                  decide_target_position, compute_qty)
+                                  decide_target_position, compute_qty,
+                                  freeze_entry)
+
+
+def infer_periods_per_year(index: pd.DatetimeIndex) -> float:
+    """
+    Barras por año = mediana de barras por día × 252.
+    No usa pd.infer_freq: con datos 1h de acciones (huecos nocturnos y fines
+    de semana) infer_freq devuelve None y el Sharpe quedaba mal anualizado.
+    """
+    if len(index) < 2:
+        return 252.0
+    per_day = pd.Series(1, index=index).groupby(index.date).sum()
+    return float(per_day.median() * 252)
 
 
 def run_pairs_backtest(panel: pd.DataFrame,
@@ -31,12 +46,22 @@ def run_pairs_backtest(panel: pd.DataFrame,
                         initial_cash: float = 100_000.0,
                         warmup_bars: int = None,
                         vix_col: str = "^VIX",
-                        verbose: bool = False) -> tuple[PaperTrader, dict]:
+                        open_panel: pd.DataFrame = None,
+                        periods_per_year: float = None,
+                        verbose: bool = False,
+                        progress: bool = True) -> tuple[PaperTrader, dict]:
     """
-    Backtest event-driven bar-por-bar.
+    Backtest event-driven bar-por-bar, sin look-ahead.
 
-    panel: DataFrame con DatetimeIndex y columnas con los closes de cada ticker.
-           Debe contener todos los tickers de los pares + opcionalmente vix_col.
+    Secuencia por barra i:
+      1. Se ejecutan las órdenes decididas en la barra i-1, al OPEN de i
+         (open_panel) o, si no hay opens, al CLOSE de i (más conservador).
+      2. Se marca el equity al close de i y se chequea el kill switch diario.
+      3. Con datos hasta el close de i se actualizan señales y se deciden
+         órdenes para la barra i+1.
+
+    panel:      closes, DatetimeIndex, columnas = tickers (+ vix_col opcional).
+    open_panel: opens con el mismo índice/columnas (opcional, recomendado).
     """
     if warmup_bars is None:
         warmup_bars = max(cfg.coint_window, cfg.beta_window, cfg.zscore_window) + 5
@@ -45,104 +70,203 @@ def run_pairs_backtest(panel: pd.DataFrame,
                          fee_bps=cfg.fee_bps,
                          slippage_bps=cfg.slippage_bps)
 
-    # Inicializar estados por par
-    states: dict[tuple[str, str], PairState] = {
-        (a, b): PairState(a=a, b=b) for (a, b) in pairs
-    }
-
-    # Filtrar pares cuyos tickers no están en el panel
     pairs_valid = [(a, b) for (a, b) in pairs
                    if a in panel.columns and b in panel.columns]
     if not pairs_valid:
         return trader, {"error": "Ningún par tiene datos en el panel."}
+    states: dict[tuple[str, str], PairState] = {
+        (a, b): PairState(a=a, b=b) for (a, b) in pairs_valid}
+    pair_cash: dict[tuple[str, str], float] = {k: 0.0 for k in states}
+    round_trips: list[dict] = []
+    pending: dict[tuple[str, str], tuple[int, str]] = {}   # par -> (target, motivo)
 
     has_vix = vix_col in panel.columns
 
-    # Iterar
+    # Calendario de trading = barras donde cotiza al menos una acción de los
+    # pares. El VIX de Yahoo tiene horario extendido (~20 barras/día vs 7 de
+    # las acciones); sin este filtro el panel trae barras solo-VIX donde las
+    # posiciones quedan sin precio, el equity salta, la volatilidad y el
+    # drawdown se inflan, se disparan kill switches falsos, el stop por tiempo
+    # cuenta horas fuera de mercado y periods_per_year sale ~3x.
+    pair_cols = sorted({t for p in pairs_valid for t in p})
+    if has_vix:
+        vix_ff = panel[vix_col].ffill()
+    keep = panel[pair_cols].notna().any(axis=1)
+    panel = panel.loc[keep].copy()
+    if has_vix:
+        panel[vix_col] = vix_ff.loc[keep]
+    if open_panel is not None:
+        open_panel = open_panel.reindex(index=panel.index)
+    # Precios para valorizar: último precio conocido (nunca futuro)
+    mark_panel = panel.ffill()
+    if warmup_bars >= len(panel):
+        return trader, {"error": "Muy pocas barras tras alinear calendario."}
+
+    blocked_day = None          # fecha bloqueada por kill switch diario
+    kill_days: list = []
+    day_key, day_high = None, None
+
+    # Pre-cálculo para no copiar la historia completa en cada barra (era O(n²)):
+    # por cada par, filas donde ambos precios existen y un puntero por barra.
+    hist_n = max(cfg.coint_window, cfg.beta_window, cfg.zscore_window)
+    pair_data = {}
+    for key in states:
+        a, b = key
+        both = panel[[a, b]].dropna()
+        pos_in_pair = np.searchsorted(both.index.values, panel.index.values, side="right")
+        pair_data[key] = (both[a].to_numpy(float), both[b].to_numpy(float), pos_in_pair)
+    last_recalc = {key: -10**9 for key in states}
+
+    n_bars = len(panel) - warmup_bars
+    t0 = time.time()
+    next_report = 0.0
+
+    def row_prices(df, i):
+        return {c: float(df[c].iloc[i]) for c in df.columns if pd.notna(df[c].iloc[i])}
+
+    def equity_now(prices):
+        return trader.cash + sum(p.qty * prices.get(p.symbol, 0.0)
+                                 for p in trader.positions.values())
+
+    def execute(key, target, reason, ts, exec_px, mark_px):
+        a, b = key
+        st = states[key]
+        px_a, px_b = exec_px.get(a), exec_px.get(b)
+        if px_a is None or px_b is None:
+            return False
+        if target == 0:
+            qa, qb = 0.0, 0.0
+        else:
+            qa, qb = compute_qty(equity_now(mark_px), px_a, px_b, st.beta,
+                                 target, cfg.gross_exposure_per_pair)
+        note = f"pair={a}/{b} z={st.z:.2f} target={target} motivo={reason}"
+        flow = 0.0
+        for sym, q, px in ((a, qa, px_a), (b, qb, px_b)):
+            prev = trader.positions[sym].qty if sym in trader.positions else 0.0
+            t = trader.submit_target(ts, sym, q, px, note=note)
+            if t is not None:
+                delta = q - prev
+                flow += -delta * t.price - t.fee_usd
+        if st.position == 0 and target != 0:
+            pair_cash[key] = flow
+            freeze_entry(st, cfg, equity_now(mark_px))
+            st.entry_cost = flow
+        else:
+            pair_cash[key] += flow
+            if target == 0:
+                round_trips.append({"pair": f"{a}/{b}", "exit_ts": ts,
+                                    "pnl_usd": pair_cash[key],
+                                    "bars_held": st.bars_held,
+                                    "motivo": reason})
+                pair_cash[key] = 0.0
+        st.position = target
+        st.last_qty_a, st.last_qty_b = qa, qb
+        if verbose:
+            print(f"[{ts}] {a}/{b} {reason or 'entrada'} target={target:+d} z={st.z:+.2f} "
+                  f"z_pos={st.z_pos:+.2f} p={st.p_value:.3f}")
+        return True
+
     for i in range(warmup_bars, len(panel)):
         ts = panel.index[i]
-        prices = {col: float(panel[col].iloc[i]) for col in panel.columns
-                  if pd.notna(panel[col].iloc[i])}
+        prices = row_prices(mark_panel, i)          # valorización (ffill)
+        live = row_prices(panel, i)                 # solo precios de esta barra
+        exec_prices = row_prices(open_panel, i) if open_panel is not None else live
+
+        # 1. Ejecutar lo decidido en la barra anterior
+        for key, (target, reason) in list(pending.items()):
+            if execute(key, target, reason, ts, exec_prices, prices):
+                pending.pop(key)
+
+        # 2. Mark-to-market y kill switch diario (máximo intradía en O(1))
+        equity = trader.mark_to_market(ts, prices)
+        today = ts.date()
+        if today != day_key:
+            day_key, day_high = today, equity
+        day_high = max(day_high, equity)
+        if blocked_day is not None and blocked_day != today:
+            blocked_day = None
+        if blocked_day is None and day_high > 0 and \
+                (equity - day_high) / day_high < -cfg.daily_loss_cap_pct:
+            blocked_day = today
+            kill_days.append(str(today))
+            for key, st in states.items():
+                if st.position != 0:
+                    pending[key] = (0, "kill_diario")
+
         vix = prices.get(vix_col) if has_vix else None
+        n_open = sum(1 for k, s in states.items()
+                     if (s.position != 0) or (k in pending and pending[k][0] != 0))
 
-        # Contar pares abiertos para enforce max_open_pairs
-        n_open = sum(1 for s in states.values() if s.position != 0)
-
-        for (a, b) in pairs_valid:
-            state = states[(a, b)]
-            a_ser = panel[a].iloc[:i+1].dropna()
-            b_ser = panel[b].iloc[:i+1].dropna()
-            if len(a_ser) < cfg.coint_window or len(b_ser) < cfg.coint_window:
+        # 3. Señales y decisiones para la próxima barra
+        for key, state in states.items():
+            if key in pending:
                 continue
-
-            # Actualizar señal
-            state = update_pair_signal(state, a_ser, b_ser, cfg)
-
-            # Decidir target
-            target = decide_target_position(state, cfg, vix=vix)
-
-            # Si vamos a abrir nuevo y ya estamos en el cap, skip
-            if state.position == 0 and target != 0 and n_open >= cfg.max_open_pairs:
+            a, b = key
+            a_arr, b_arr, ptr = pair_data[key]
+            k = int(ptr[i])                      # filas válidas hasta la barra i inclusive
+            if k < cfg.coint_window:
                 continue
+            if state.position != 0:
+                state.bars_held += 1
+            recompute = (k - last_recalc[key]) >= cfg.recalc_every
+            if recompute:
+                last_recalc[key] = k
+            lo = max(0, k - hist_n)
+            update_pair_signal(state, a_arr[lo:k], b_arr[lo:k], cfg, recompute=recompute)
+
+            pnl = 0.0
+            if state.position != 0 and a in prices and b in prices:
+                pnl = pair_cash[key] + state.last_qty_a * prices[a] + state.last_qty_b * prices[b]
+            target = decide_target_position(state, cfg, vix=vix, pair_pnl=pnl)
 
             if target == state.position:
-                states[(a, b)] = state
                 continue
-
-            # Ejecutar el cambio
-            px_a = prices.get(a); px_b = prices.get(b)
-            if px_a is None or px_b is None:
-                continue
-
-            qty_a, qty_b = compute_qty(
-                equity=trader.cash + sum(p.qty * prices.get(p.symbol, 0)
-                                          for p in trader.positions.values()),
-                price_a=px_a, price_b=px_b,
-                beta=state.beta,
-                target_position=target,
-                gross_exposure_per_pair=cfg.gross_exposure_per_pair,
-            )
-            note = f"pair={a}/{b} z={state.z:.2f} target={target}"
-            trader.submit_target(ts, a, qty_a, px_a, note=note)
-            trader.submit_target(ts, b, qty_b, px_b, note=note)
-
             if state.position == 0 and target != 0:
-                state.entry_z = state.z
+                if blocked_day is not None or n_open >= cfg.max_open_pairs:
+                    continue
                 n_open += 1
-            elif target == 0 and state.position != 0:
-                n_open -= 1
+            pending[key] = (target, state.exit_reason)
 
-            state.position = target
-            state.last_qty_a = qty_a
-            state.last_qty_b = qty_b
-            states[(a, b)] = state
-
-            if verbose and target != 0:
-                print(f"[{ts}] {a}/{b} z={state.z:+.2f} pval={state.p_value:.3f} "
-                      f"target={target:+d} qty_a={qty_a:.2f} qty_b={qty_b:.2f}")
-
-        # Marcar equity al close de la barra
-        trader.mark_to_market(ts, prices)
+        if progress and n_bars > 0:
+            frac = (i - warmup_bars + 1) / n_bars
+            if frac >= next_report or i == len(panel) - 1:
+                el = time.time() - t0
+                eta = el / frac * (1 - frac) if frac > 0 else 0
+                n_pos = sum(1 for s_ in states.values() if s_.position != 0)
+                print(f"  [{frac*100:5.1f}%] barra {i+1}/{len(panel)} {ts:%Y-%m-%d} "
+                      f"equity=${equity:,.0f} abiertos={n_pos} "
+                      f"trades={len(round_trips)} | {el:,.0f}s, faltan ~{eta:,.0f}s",
+                      flush=True)
+                next_report += 0.05
 
     # Cerrar posiciones al final del backtest
     last_ts = panel.index[-1]
-    last_prices = {col: float(panel[col].iloc[-1]) for col in panel.columns
-                   if pd.notna(panel[col].iloc[-1])}
-    trader.close_all(last_ts, last_prices)
+    last_prices = row_prices(mark_panel, len(panel) - 1)
+    for key, st in states.items():
+        if st.position != 0:
+            execute(key, 0, "fin_backtest", last_ts, last_prices, last_prices)
     trader.mark_to_market(last_ts, last_prices)
 
-    # Calcular métricas (asume datos 1h con 6.5h * 252 días = 1638)
-    inferred_periods = 252 * 6.5 if pd.infer_freq(panel.index[:50]) in ("h", "1h", "H") else 252
-    metrics = trader.metrics(periods_per_year=inferred_periods)
+    ppy = periods_per_year or infer_periods_per_year(panel.index)
+    metrics = trader.metrics(periods_per_year=ppy)
+    metrics["periods_per_year"] = ppy
 
-    # Estado final de los pares
-    states_summary = {f"{a}/{b}": {
+    rt = pd.DataFrame(round_trips)
+    if not rt.empty:
+        metrics["n_round_trips"] = int(len(rt))
+        metrics["hit_rate_pairs_pct"] = float((rt["pnl_usd"] > 0).mean() * 100)
+        metrics["pnl_by_exit"] = rt.groupby("motivo")["pnl_usd"].agg(["count", "sum"]).round(2).to_dict("index")
+        metrics["pnl_by_pair"] = rt.groupby("pair")["pnl_usd"].agg(["count", "sum"]).round(2).to_dict("index")
+    else:
+        metrics["n_round_trips"] = 0
+    metrics["kill_switch_days"] = kill_days
+    metrics["round_trips"] = rt
+
+    metrics["pairs_states_final"] = {f"{a}/{b}": {
         "p_value": s.p_value, "beta": s.beta,
-        "spread_std": s.spread_std, "z_final": s.z,
+        "half_life": s.half_life, "z_final": s.z,
         "position_final": s.position,
     } for (a, b), s in states.items()}
-
-    metrics["pairs_states_final"] = states_summary
     return trader, metrics
 
 
@@ -200,6 +324,8 @@ if __name__ == "__main__":
     print("BACKTEST DEMO — Pairs Trading sintético")
     print("=" * 60)
     for k, v in metrics.items():
+        if k == "round_trips":
+            continue
         if k == "pairs_states_final":
             print(f"\n{k}:")
             for pk, pv in v.items():
