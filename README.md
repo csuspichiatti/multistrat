@@ -78,7 +78,7 @@ Output of every backtest includes Sharpe (annualized with bars-per-day inferred 
 ## Status
 
 - Core: complete
-- Strategy 1: backtest engine complete with risk layer; **pending validation on real data** (`python -m backtest.run_real_pairs`). On synthetic data it is roughly breakeven after costs: it trades the cointegrated pair correctly but the edge is thin. Do not trade it live on the strength of the synthetic demo.
+- Strategy 1: backtest engine complete with risk layer. **No edge on real data with the default parameters.** Run of 2026-11-20 on the 8 default pairs, yfinance 1h, 2024-07 to 2026-11 after warm-up: total return −0.64%, Sharpe −0.81, max drawdown −0.67%, 38 pair round trips, 42% hit rate. z-stops lost $1,446 in 19 exits vs $978 earned by 14 take-profits; fees $393. Exposure is small (10% gross per pair, usually 0–1 pairs open; annual vol 0.34%), so the absolute numbers are small too; the useful reading is the sign and the stop/TP balance, not the size. On synthetic data the engine is roughly breakeven after costs. Treat this as a research framework, not a trading system.
 - Strategies 2 and 3: not implemented
 - Live execution via MetaTrader5 (Capitaria CFDs): planned phase 2. Before going live it needs leg-risk handling (unwind the filled leg if the other one fails), position reconciliation after reconnects, and an earnings blackout.
 
